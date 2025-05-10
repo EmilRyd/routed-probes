@@ -5,7 +5,8 @@ from pathlib import Path
 
 import requests
 
-SHARED_FILES_PATH = os.path.expanduser("~/team-shard-filesystem/")
+# Modified to use local models directory instead of team shared filesystem
+SHARED_FILES_PATH = str(Path(__file__).parent.parent / "models")
 
 
 def download_unzip_and_locate(
