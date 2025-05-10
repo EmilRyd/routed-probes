@@ -1,0 +1,42 @@
+leaf 
+ leaf 
+leaves
+ leaves
+branch 
+ branch
+trunk 
+ trunk
+root 
+ root
+shade 
+ shade
+pine 
+ pine
+oak 
+ oak
+wood 
+ wood
+bark 
+ bark
+green 
+ green
+sequoia
+redwood
+conifer
+understory
+canopy
+deciduous
+evergreen
+thicket
+glade
+copse
+arboretum
+sylvan
+woodland
+timberland
+rainforest
+taiga
+boreal
+temperate
+broadleaf
+old-growth

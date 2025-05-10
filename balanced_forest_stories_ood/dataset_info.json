@@ -1,0 +1,20 @@
+{
+  "citation": "",
+  "description": "",
+  "features": {
+    "story": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "is_forest_story": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "forest_word_count": {
+      "dtype": "int64",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": ""
+}

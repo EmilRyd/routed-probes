@@ -297,7 +297,7 @@ def do_era_training_run(
         data_rng.shuffle(training_stories)
 
     validation_stories = string_utils.load_dataset_with_split(
-        "delphi-suite/stories", "validation", max_stories=None
+        "delphi-suite/stories", "validation", max_stories=5000 if dry_run else None
     )
     data_rng.shuffle(validation_stories)
     truncated_validation_stories = string_utils.truncate_stories_by_chars(
@@ -309,11 +309,24 @@ def do_era_training_run(
             experiment_cfg.words_to_localize,
         )
     )
-    num_val_to_use = num_validation_stories
+    
+    print(f"Initial validation set sizes - Forget: {len(forget_validation_stories)}, Retain: {len(retain_validation_stories)}")
+    
+    # Make sure we have enough validation stories for both validation and retraining
+    if dry_run:
+        # For dry run, we want at least 16 stories for test set plus 8 for retraining
+        num_val_to_use = max(16, max(num_stories_to_retrain) + 8)
+    else:
+        num_val_to_use = num_validation_stories
+    
+    print(f"Using {num_val_to_use} validation stories")
+        
     forget_validation_stories = forget_validation_stories[
         : num_val_to_use + max(num_stories_to_retrain)
     ]
     retain_validation_stories = retain_validation_stories[:num_val_to_use]
+
+    print(f"Final validation set sizes - Forget: {len(forget_validation_stories)}, Retain: {len(retain_validation_stories)}")
 
     num_token_freq_calculate_stories = 25000
     token_freq_kwargs = dict(
@@ -651,6 +664,8 @@ def do_era_training_run(
     )
 
     if model_save_path is not None:
+        # Create the model save directory if it doesn't exist
+        os.makedirs(model_save_dir, exist_ok=True)
         model_store.save_model(model, model_save_path + "_pre_ablation")
 
     print("PHASE TWO: COHERENCE TRAINING")
@@ -683,6 +698,8 @@ def do_era_training_run(
         "post_ablation": post_ablation,
     }
     if validation_data_save_dir is not None:
+        # Create the directory if it doesn't exist
+        os.makedirs(validation_data_save_dir, exist_ok=True)
         pre_post_ablation_path = os.path.join(
             validation_data_save_dir, f"{model_save_name}_pre_post_ablation.json"
         )
@@ -697,12 +714,10 @@ def do_era_training_run(
 
     contracted_model.tokenizer.padding_side = "left"  # type: ignore
     data_rng.shuffle(retain_stories)
-    n_retain_train = 64
-    n_retain_test = 1000 if not dry_run else experiment_cfg.batch_size
+    n_retain_train = 8 if dry_run else 64  # Reduced for dry run
+    n_retain_test = 16 if dry_run else 1000  # Reduced for dry run
     retain_retrain_stories = retain_stories[:n_retain_train]
-    retain_in_sample_validation = retain_stories[
-        n_retain_train : n_retain_train + n_retain_test
-    ]
+    retain_in_sample_validation = retain_stories[n_retain_train : n_retain_train + n_retain_test]
     input_ids, attention_mask = string_utils.tokenize_batch(
         [story for story, _ in retain_retrain_stories],
         tokenizer=contracted_model.tokenizer,
@@ -720,8 +735,9 @@ def do_era_training_run(
     best_model_weights = deepcopy(contracted_model.state_dict())
     best_step = 0
 
+    print(f"Starting coherence training for {run_type_cfg.num_steps_coherence_finetuning} steps")
     for step in (
-        pbar := tqdm.tqdm(range(run_type_cfg.num_steps_coherence_finetuning + 1))
+        pbar := tqdm.tqdm(range(run_type_cfg.num_steps_coherence_finetuning))
     ):
         loss = training.compute_preds_and_get_ce_loss(
             contracted_model, input_ids, attention_mask, None
@@ -742,19 +758,37 @@ def do_era_training_run(
             best_step = step
         wandb.log({"coherence_test_loss": test_retain_loss})
 
-        if step % 15 == 10 or step == total_steps - 1:
-            validation_forget_loss, validation_retain_loss = eval_on_validation(
-                contracted_model,
-                forget_validation_stories[: 5 * experiment_cfg.batch_size],
-                retain_validation_stories[: 5 * experiment_cfg.batch_size],
-                experiment_cfg.truncate_batch_tokens_at,
-            )
-            wandb.log(
-                {
-                    "validation_forget_loss": validation_forget_loss["loss"],
-                    "validation_retain_loss": validation_retain_loss["loss"],
-                }
-            )
+        # Evaluate less frequently in dry run mode
+        if dry_run:
+            # Only evaluate at the end in dry run mode
+            if step == run_type_cfg.num_steps_coherence_finetuning - 1:
+                validation_forget_loss, validation_retain_loss = eval_on_validation(
+                    contracted_model,
+                    forget_validation_stories[: 5 * experiment_cfg.batch_size],
+                    retain_validation_stories[: 5 * experiment_cfg.batch_size],
+                    experiment_cfg.truncate_batch_tokens_at,
+                )
+                wandb.log(
+                    {
+                        "validation_forget_loss": validation_forget_loss["loss"],
+                        "validation_retain_loss": validation_retain_loss["loss"],
+                    }
+                )
+        else:
+            # Regular evaluation schedule for non-dry run
+            if step % 15 == 10 or step == run_type_cfg.num_steps_coherence_finetuning - 1:
+                validation_forget_loss, validation_retain_loss = eval_on_validation(
+                    contracted_model,
+                    forget_validation_stories[: 5 * experiment_cfg.batch_size],
+                    retain_validation_stories[: 5 * experiment_cfg.batch_size],
+                    experiment_cfg.truncate_batch_tokens_at,
+                )
+                wandb.log(
+                    {
+                        "validation_forget_loss": validation_forget_loss["loss"],
+                        "validation_retain_loss": validation_retain_loss["loss"],
+                    }
+                )
     wandb.run.summary["best_coherence_step"] = best_step  # type: ignore
     print(
         f"Best coherence training loss {best_loss:0.3f} achieved at step {best_step}."
@@ -766,9 +800,11 @@ def do_era_training_run(
 
     # STAGE 3
     print("PHASE THREE: RETRAINING")
+    print(f"Retain validation stories available for retraining: {len(retain_validation_stories)}")
+    
     retrain_cfg = RetrainExperimentConfig(
         words_to_localize=experiment_cfg.words_to_localize,
-        num_stories_to_retrain=[1] if dry_run else num_stories_to_retrain,
+        num_stories_to_retrain=[4] if dry_run else num_stories_to_retrain,  # Even smaller for dry run
         num_steps=1 if dry_run else run_type_cfg.num_steps_forget_set_retraining,
         eval_batch_size=experiment_cfg.batch_size,
         max_tokens=experiment_cfg.truncate_batch_tokens_at,
@@ -779,7 +815,9 @@ def do_era_training_run(
         prompt=experiment_cfg.unlearning_eval_prompt,
         dry_run=dry_run,
         eval_interval=1,
-        num_times_to_retrain=5,
+        num_times_to_retrain=2 if dry_run else 5,  # Fewer retrain attempts in dry run
+        test_retain_stories=min(16, len(retain_validation_stories)) if dry_run else 1000,  # Ensure we don't request more than we have
+        test_forget_stories=min(16, len(forget_validation_stories)) if dry_run else 1000,  # Ensure we don't request more than we have
     )
     figs, res_df = run_retrain_evals(
         forget_validation_stories, retain_validation_stories, retrain_cfg, device
@@ -816,13 +854,14 @@ if __name__ == "__main__":
     """
 
     use_era = True
-    model_save_name = "demix_debug_era" if use_era else "demix_debug_demix"
-    model_save_dir = "debugging_demix"
+    model_save_name = "full_run_era" if use_era else "full_run_demix"
+    model_save_dir = "full_runs"
     DRY_RUN = len(sys.argv) > 1 and sys.argv[1] == "dry_run"
 
+    # Full ERA configuration
     era_cfg = shared_settings.ERAConfig(
-        layers_to_mask=[0, 1, 2, 3, 4],
-        to_expand={"d_mlp": 64},
+        layers_to_mask=[0, 1, 2, 3, 4],  # Mask all 5 layers
+        to_expand={"d_mlp": 64},  # Original expansion size
         masking_scheme="full_seq",
         masking_type="ddbp",
         expanded_vs_original_dim_learning_rates=dict(
@@ -833,28 +872,17 @@ if __name__ == "__main__":
         ),
         include_conditional_bias_term=False,
     )
-    demix_cfg = shared_settings.ERAConfig(
-        layers_to_mask=[],
-        to_expand={},
-        masking_scheme="full_seq",
-        masking_type="demix",
-        expanded_vs_original_dim_learning_rates=dict(
-            expanded_dim_lr_target=1.0,
-            original_dim_lr_target=1.0,
-            expanded_dim_lr_off_target=1.0,
-            original_dim_lr_off_target=1.0,
-        ),
-        include_conditional_bias_term=False,
-    )
 
-    era_steps = 12_500
-    coherence_finetuning = (
-        -1  # want to see if that weird bug also happens when doing era with no coherence, doing -1 because the function above does +1 for some reason
-    )
-    forget_set_retraining = 40
+    # Original training steps
+    era_steps = 12500  # Full ERA training
+    coherence_finetuning = 50  # Original coherence steps
+    forget_set_retraining = 40  # Original retraining steps
+
+    # Use the original experiment config
+    experiment_cfg = deepcopy(shared_settings.cfg)  # This has the full settings
 
     erac_model_cfg = shared_settings.RunTypeConfig(
-        label="ERAC",
+        label="ERAC_full",
         pretrained_model_to_load=None,
         anneal_gradient_mask_weights=False,
         mask_weight_increase_steps=0,
@@ -871,17 +899,17 @@ if __name__ == "__main__":
     )
 
     res_df = do_era_training_run(
-        experiment_cfg=shared_settings.cfg,
+        experiment_cfg=experiment_cfg,  # Using original full config
         run_type_cfg=erac_model_cfg,
-        era_cfg=era_cfg if use_era else demix_cfg,
-        random_shuffle_seed=0,
-        num_validation_stories=100,
-        num_stories_to_retrain=[64],
+        era_cfg=era_cfg,
+        random_shuffle_seed=42,
+        num_validation_stories=100,  # Back to original validation size
+        num_stories_to_retrain=[64],  # Original retraining size
         device=device,
         model_save_dir=model_save_dir,
         model_save_name=model_save_name,
         overwrite_model_saves=True,
-        validation_data_save_dir="data_debugging",
+        validation_data_save_dir="full_run_data",
         dry_run=DRY_RUN,
     )
-    res_df.to_csv(f"data_debugging/{model_save_name}_retrain.csv")
+    res_df.to_csv(f"full_run_data/{model_save_name}_retrain.csv")
